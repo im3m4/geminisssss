@@ -5,6 +5,7 @@ import socket
 import urllib.parse
 import threading
 import webbrowser
+from datetime import datetime, timezone
 import requests
 from flask import Flask, jsonify, request, render_template_string
 
@@ -83,9 +84,7 @@ def verify_username_existence(username):
     }
     for platform, url in targets.items():
         try:
-            # Execute real network probe
             response = requests.get(url, headers=headers, timeout=3.5)
-            # 200 OK generally means user profile is occupied
             results[platform] = {
                 "exists": response.status_code == 200,
                 "url": url
@@ -96,6 +95,82 @@ def verify_username_existence(username):
                 "url": url
             }
     return results
+
+
+def fetch_live_incidents(limit=20):
+    """Collects live incident-like events from public geospatial APIs."""
+    events = []
+    headers = {"User-Agent": "SentryGlobe/2.0"}
+
+    try:
+        usgs_res = requests.get(
+            "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson",
+            headers=headers,
+            timeout=10,
+        )
+        usgs_data = usgs_res.json()
+        for feature in usgs_data.get("features", [])[:limit]:
+            coordinates = feature.get("geometry", {}).get("coordinates", [])
+            if len(coordinates) < 3:
+                continue
+            lng, lat, depth = coordinates[0], coordinates[1], coordinates[2]
+            properties = feature.get("properties", {})
+            events.append({
+                "id": feature.get("id", "usgs-event"),
+                "title": f"Sismo M {properties.get('mag', 0)} - {properties.get('place', 'Región no identificada')}",
+                "category": "Geológico",
+                "severity": "CRITICAL" if properties.get("mag", 0) >= 5.0 else "WARNING",
+                "locationName": properties.get("place", "Región remota"),
+                "lat": lat,
+                "lng": lng,
+                "time": datetime.fromtimestamp(properties.get("time", 0) / 1000, timezone.utc).strftime("%H:%M:%S UTC"),
+                "desc": f"Reporte geológico proveniente del servicio de sismología USGS. Profundidad: {depth} km.",
+                "sensorCode": f"USGS-{feature.get('id', 'event').upper()}",
+                "sources": [{"uri": properties.get("url", "https://earthquake.usgs.gov"), "title": "USGS Earthquake"}],
+            })
+    except Exception as exc:
+        print(f"USGS fetch failed: {exc}")
+
+    try:
+        nasa_res = requests.get(
+            "https://eonet.gsfc.nasa.gov/api/v3/events?limit=12&status=open",
+            headers=headers,
+            timeout=10,
+        )
+        nasa_data = nasa_res.json()
+        for item in nasa_data.get("events", []):
+            geometry = item.get("geometry", [])
+            if not geometry:
+                continue
+            point = geometry[0]
+            if point.get("type") != "Point":
+                continue
+            lng, lat = point.get("coordinates", [0, 0])[:2]
+            category = item.get("categories", [{}])[0].get("title", "Ambiental")
+            translated = "Climático"
+            if category == "Volcanoes":
+                translated = "Volcánico"
+            elif category == "Wildfires":
+                translated = "Incendio Forestal"
+            elif category == "Severe Storms":
+                translated = "Tormenta Severa"
+            events.append({
+                "id": item.get("id", "nasa-event"),
+                "title": item.get("title", "Evento ambiental satelital"),
+                "category": translated,
+                "severity": "WARNING",
+                "locationName": "Localización satelital NASA",
+                "lat": lat,
+                "lng": lng,
+                "time": datetime.fromtimestamp(int(point.get("date", 0) / 1000) if isinstance(point.get("date"), (int, float)) else 0, timezone.utc).strftime("%H:%M:%S UTC") if isinstance(point.get("date"), (int, float)) else "UTC",
+                "desc": "Actividad detectada por los satélites meteorológicos de la NASA y consolidada en tiempo real.",
+                "sensorCode": f"NASA-{item.get('id', 'event')}",
+                "sources": [{"uri": "https://eonet.gsfc.nasa.gov/", "title": "NASA EONET"}],
+            })
+    except Exception as exc:
+        print(f"NASA fetch failed: {exc}")
+
+    return events
 
 
 @app.route("/")
@@ -137,6 +212,41 @@ def api_exif_parse():
         return jsonify(gps_coords)
     return jsonify({"error": "No valid GPS metadata found in the EXIF directory."}), 404
 
+@app.route("/api/health")
+def api_health():
+    """Returns basic health status for the monitoring dashboard."""
+    return jsonify({
+        "ok": True,
+        "service": "SentryGlobe",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "pillow": HAS_PILLOW,
+    })
+
+@app.route("/api/live_feed")
+def api_live_feed():
+    """Returns consolidated live incident data for the front-end map and feed."""
+    events = fetch_live_incidents()
+    return jsonify({"events": events, "count": len(events), "generated_at": datetime.now(timezone.utc).isoformat()})
+
+@app.route("/api/geocode")
+def api_geocode():
+    """Geocodes a free-form query using Nominatim."""
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"error": "No query provided"}), 400
+
+    try:
+        res = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"format": "json", "q": query, "limit": 1, "addressdetails": 1},
+            headers={"User-Agent": "SentryGlobe/2.0"},
+            timeout=8,
+        )
+        data = res.json()
+        return jsonify({"results": data})
+    except Exception as exc:
+        return jsonify({"error": f"Geocoding failed: {exc}"}), 500
+
 @app.route("/api/recon_username", methods=["POST"])
 def api_recon_username():
     """Runs a live network reconnaissance sweep on a specific handle."""
@@ -167,7 +277,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         
         body {
             font-family: 'Inter', sans-serif;
-            background-color: #09090b;
+            background: radial-gradient(circle at top left, rgba(6, 182, 212, 0.12), transparent 24%), #09090b;
+        }
+
+        .glass-panel {
+            background: rgba(9, 9, 11, 0.9);
+            backdrop-filter: blur(12px);
+            box-shadow: 0 18px 60px rgba(2, 6, 23, 0.35);
+        }
+
+        .soft-card {
+            border: 1px solid rgba(255,255,255,0.06);
+            background: linear-gradient(180deg, rgba(17,24,39,0.9), rgba(9,9,11,0.9));
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+        }
+
+        button, input, select {
+            transition: all 180ms ease;
         }
 
         .font-mono-tactical {
@@ -272,7 +398,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body class="h-full w-full bg-[#09090b] text-zinc-100 flex flex-col overflow-hidden">
 
-    <header class="h-12 border-b border-zinc-800/80 bg-[#09090b] flex items-center justify-between px-4 shrink-0 z-20">
+    <header class="h-12 border-b border-zinc-800/80 bg-[#09090b]/90 backdrop-blur-xl flex items-center justify-between px-4 shrink-0 z-20">
         <div class="flex items-center gap-3">
             <div class="relative flex items-center justify-center w-7 h-7 rounded border border-cyan-500/30 bg-cyan-950/10">
                 <i class="fa-solid fa-satellite-dish text-cyan-400 text-xs"></i>
@@ -286,7 +412,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="flex items-center gap-4 text-[10px] font-mono-tactical">
             <div class="hidden md:flex items-center gap-2 border-r border-zinc-800 pr-4">
                 <span class="text-zinc-600">PYTHON BACKEND:</span>
-                <span class="text-emerald-500 font-medium">CONECTADO</span>
+                <span id="backend-status" class="text-emerald-500 font-medium">CONECTADO</span>
             </div>
             <div class="hidden sm:flex items-center gap-2">
                 <i class="fa-regular fa-clock text-cyan-500"></i>
@@ -620,6 +746,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let tacticalGeodesicLine = null;
 
         let incidentEvents = [];
+        let backendHealth = { ok: false };
 
         // 3D parameters
         let scene3D, camera3D, renderer3D, globe3D, pointSpikesGroup;
@@ -734,6 +861,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 initAudioContext();
             }, { once: true });
 
+            await checkBackendHealth();
             await geolocalizeUserOnStart();
             await fetchLiveRealData();
 
@@ -758,10 +886,32 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
+        async function checkBackendHealth() {
+            try {
+                const res = await fetch('/api/health');
+                const data = await res.json();
+                backendHealth = data;
+                const badge = document.getElementById('backend-status');
+                if (badge) {
+                    badge.textContent = data.ok ? 'CONECTADO' : 'SIN CONEXIÓN';
+                    badge.className = data.ok ? 'text-emerald-500 font-medium' : 'text-amber-500 font-medium';
+                }
+                if (data.ok) {
+                    writeLog('Backend operativo y conectado a la capa de datos.', 'success');
+                }
+            } catch (e) {
+                const badge = document.getElementById('backend-status');
+                if (badge) {
+                    badge.textContent = 'SIN CONEXIÓN';
+                    badge.className = 'text-amber-500 font-medium';
+                }
+                writeLog('El backend no respondió a la comprobación de salud.', 'warning');
+            }
+        }
+
         async function geolocalizeUserOnStart() {
             writeLog('Detectando firma geográfica de red...', 'info');
             try {
-                // Fetch local user metadata using Python proxy or standard secure SSL tracker
                 const res = await fetch('https://ipapi.co/json/');
                 const data = await res.json();
                 if (data && data.latitude && data.longitude) {
@@ -802,72 +952,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         async function fetchLiveRealData() {
-            writeLog('Iniciando ingesta de Datos Geológicos Reales (USGS)...', 'info');
-            
+            writeLog('Consultando capa de eventos en vivo desde el backend...', 'info');
             try {
-                const usgsRes = await fetch('https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson');
-                const usgsData = await usgsRes.json();
-                
-                if (usgsData.features) {
-                    writeLog(`Ingeridos exitosamente ${usgsData.features.length} sismos globales del USGS.`, 'success');
-                    usgsData.features.slice(0, 30).forEach(f => {
-                        const [lng, lat] = f.geometry.coordinates;
-                        incidentEvents.push({
-                            id: f.id,
-                            title: `Sismo M ${f.properties.mag} - ${f.properties.place}`,
-                            category: 'Geológico',
-                            severity: f.properties.mag >= 5.0 ? 'CRITICAL' : 'WARNING',
-                            locationName: f.properties.place,
-                            lat: lat,
-                            lng: lng,
-                            time: new Date(f.properties.time).toUTCString().split(' ')[4] + ' UTC',
-                            desc: `${f.properties.title}. Profundidad: ${f.geometry.coordinates[2]} km. Reporte geológico de sismógrafos globales.`,
-                            sensorCode: `USGS-${f.id.toUpperCase()}`,
-                            sources: [{ uri: f.properties.url, title: 'USGS Earthquake' }]
-                        });
-                    });
+                const res = await fetch('/api/live_feed');
+                const payload = await res.json();
+                if (payload.events && payload.events.length) {
+                    incidentEvents = payload.events;
+                    writeLog(`Se cargaron ${payload.count} eventos operativos desde el backend.`, 'success');
+                } else {
+                    writeLog('El backend devolvió datos vacíos; se mantiene la vista en modo de contingencia.', 'warning');
                 }
             } catch (e) {
-                writeLog('Fallo al conectar con la API de Sismología del USGS.', 'warning');
-            }
-
-            writeLog('Iniciando ingesta de Eventos Climáticos de la NASA (EONET)...', 'info');
-            try {
-                const nasaRes = await fetch('https://eonet.gsfc.nasa.gov/api/v3/events?limit=20&status=open');
-                const nasaData = await nasaRes.json();
-                
-                if (nasaData.events) {
-                    writeLog(`Ingeridos exitosamente ${nasaData.events.length} eventos ambientales satelitales de la NASA.`, 'success');
-                    nasaData.events.forEach(e => {
-                        let geom = e.geometry && e.geometry[0];
-                        if (geom && geom.coordinates && geom.type === 'Point') {
-                            const [lng, lat] = geom.coordinates;
-                            const cat = e.categories && e.categories[0] ? e.categories[0].title : 'Ambiental';
-                            
-                            let translatedCat = 'Climático';
-                            if (cat === 'Volcanoes') translatedCat = 'Volcánico';
-                            if (cat === 'Wildfires') translatedCat = 'Incendio Forestal';
-                            if (cat === 'Severe Storms') translatedCat = 'Tormenta Severa';
-                            if (cat === 'Sea and Lake Ice') translatedCat = 'Capa de Hielo';
-
-                            incidentEvents.push({
-                                id: e.id,
-                                title: e.title,
-                                category: translatedCat,
-                                severity: 'WARNING',
-                                locationName: 'Localización Satelital NASA',
-                                lat: lat,
-                                lng: lng,
-                                time: new Date(geom.date).toUTCString().split(' ')[4] + ' UTC',
-                                desc: `Actividad extrema reportada y confirmada visualmente por los satélites meteorológicos de la NASA (EONET Catalog ID: ${e.id}).`,
-                                sensorCode: `NASA-${e.id}`,
-                                sources: e.sources && e.sources[0] ? [{ uri: e.sources[0].url, title: e.sources[0].id }] : [{ uri: 'https://eonet.gsfc.nasa.gov/', title: 'NASA EONET' }]
-                            });
-                        }
-                    });
-                }
-            } catch (e) {
-                writeLog('Fallo al conectar con la API de Eventos Satelitales EONET de la NASA.', 'warning');
+                writeLog('No fue posible recuperar la fuente de eventos en vivo.', 'warning');
             }
 
             refreshMapMarkers();
@@ -1861,9 +1957,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             loaderStatus.innerText = `Geolocalizando ${query} en los servidores globales...`;
 
             try {
-                const geocodeUrl = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`;
+                const geocodeUrl = `/api/geocode?q=${encodeURIComponent(query)}`;
                 const geoRes = await fetch(geocodeUrl);
-                const geoData = await geoRes.json();
+                const geoPayload = await geoRes.json();
+                const geoData = geoPayload.results || [];
 
                 if (!geoData || geoData.length === 0) {
                     writeLog(`No se pudo geolocalizar la región: ${query}`, 'warning');
